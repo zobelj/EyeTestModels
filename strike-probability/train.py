@@ -4,13 +4,15 @@ import time
 import pandas as pd
 import numpy as np
 import xgboost as xgb
-from sklearn.model_selection import train_test_split, cross_val_score, RandomizedSearchCV
+from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, accuracy_score
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, accuracy_score, log_loss
 from scipy.stats import binned_statistic_2d
 import json
 import matplotlib.pyplot as plt
 import seaborn as sns
+import optuna
+from optuna.samplers import TPESampler
 
 import onnxmltools
 from onnxmltools.convert.xgboost.operator_converters.XGBoost import convert_xgboost
@@ -27,6 +29,10 @@ SKIP_HYPERPARAMETER_TUNING = False
 SKIP_ALL_TRAINING = SKIP_HYPERPARAMETER_TUNING
 SAVE_MODEL = True
 DRAW_STRIKE_ZONE_HEATMAP = False
+
+# Optuna configuration
+OPTUNA_N_TRIALS = 200
+OPTUNA_TIMEOUT = 3600  # 1 hour timeout
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -72,14 +78,14 @@ def main():
 
         if not SKIP_HYPERPARAMETER_TUNING:
             print("-" * 40)
-            tuned_model, best_params, tuning_score = tune_hyperparameters(
+            tuned_model, best_params, tuning_score = tune_hyperparameters_optuna(
                 X_train, y_train, X_val, y_val
             )
 
-            improvement = tuning_score - baseline_score
-            print("\nQuick Tuning Results:")
-            print(f"Baseline AUC: {baseline_score:.4f}")
-            print(f"Tuned AUC: {tuning_score:.4f}")
+            improvement = baseline_score - tuning_score  # Lower is better for log loss
+            print("\nOptuna Tuning Results:")
+            print(f"Baseline Log Loss: {baseline_score:.4f}")
+            print(f"Tuned Log Loss: {tuning_score:.4f}")
             print(f"Improvement: {improvement:.4f}")
 
             final_model = tuned_model
@@ -110,8 +116,8 @@ def main():
         print("\n" + "=" * 60)
         print("TRAINING COMPLETE")
         print("=" * 60)
-        print(f"Baseline AUC: {baseline_score:.4f}")
-        print(f"Final Test AUC: {final_score:.4f}")
+        print(f"Baseline Log Loss: {baseline_score:.4f}")
+        print(f"Final Test Log Loss: {final_score:.4f}")
         print(f"Model saved: {'Yes' if SAVE_MODEL else 'No'}")
         if SAVE_MODEL:
             print(f"Output directory: {OUTPUT_DIR}")
@@ -197,7 +203,7 @@ def train_baseline_model(X_train, y_train, X_val, y_val):
         'random_state': 42,
         'n_estimators': 100,
         'verbosity': 0,
-        'early_stoppin/g_rounds': 100
+        'early_stopping_rounds': 100
     }
 
     model = xgb.XGBClassifier(**baseline_params)
@@ -211,94 +217,152 @@ def train_baseline_model(X_train, y_train, X_val, y_val):
     return model
 
 def evaluate_model_quick(model, X, y, dataset_name="Dataset"):
-    y_pred_proba = model.predict_proba(X)[:, 1]
-    auc = roc_auc_score(y, y_pred_proba)
-    print(f"✓ {dataset_name} AUC: {auc:.4f}")
-    return auc
+    y_pred_proba = model.predict_proba(X)
+    logloss = log_loss(y, y_pred_proba)
+    print(f"✓ {dataset_name} Log Loss: {logloss:.4f}")
+    return logloss
 
 def evaluate_model_comprehensive(model, X_test, y_test, dataset_name="Test"):
     print(f"\nComprehensive evaluation on {dataset_name} set...")
 
     y_pred = model.predict(X_test)
-    y_pred_proba = model.predict_proba(X_test)[:, 1]
+    y_pred_proba = model.predict_proba(X_test)
 
     accuracy = accuracy_score(y_test, y_pred)
-    auc = roc_auc_score(y_test, y_pred_proba)
+    logloss = log_loss(y_test, y_pred_proba)
+    auc = roc_auc_score(y_test, y_pred_proba[:, 1])  # Keep AUC for reference
 
     print(f"Accuracy: {accuracy:.4f}")
+    print(f"Log Loss: {logloss:.4f}")
     print(f"AUC-ROC: {auc:.4f}")
     print("\nDetailed Classification Report:")
     print(classification_report(y_test, y_pred, target_names=['Ball', 'Strike']))
 
-    return auc
+    return logloss
 
-def tune_hyperparameters(X_train, y_train, X_val, y_val):
-    print("Starting quick hyperparameter tuning...")
-    start_time = time.time()
+def objective(trial, X_train, y_train, X_val, y_val):
+    """Optuna objective function for hyperparameter optimization."""
 
-    param_dist = {
-        'max_depth': [3, 4, 5],
-        'learning_rate': [0.15, 0.20, 0.25],
-        'n_estimators': [200],
-        'subsample': [0.85, 0.9, 0.95],
-        'colsample_bytree': [0.8, 0.85, 0.9],
-        'reg_alpha': [0.05, 0.1, 0.2],
-        'reg_lambda': [0.05, 0.1, 0.2],
-        'min_child_weight': [16, 32, 64],
+    # Define hyperparameter search space
+    params = {
+        'objective': MODEL_OBJ,
+        'eval_metric': 'logloss',
+        'verbosity': 0,
+        'random_state': 42,
+
+        # Hyperparameters to optimize
+        'max_depth': trial.suggest_int('max_depth', 3, 8),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+        'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
+        'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+        'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
+        'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
+        'min_child_weight': trial.suggest_int('min_child_weight', 1, 100),
+        'gamma': trial.suggest_float('gamma', 1e-8, 10.0, log=True),
+        'early_stopping_rounds': 50
     }
 
-    xgb_model = xgb.XGBClassifier(
-        objective=MODEL_OBJ,
-        eval_metric='logloss',
-        random_state=42,
-        verbosity=0
+    # Create and train model
+    model = xgb.XGBClassifier(**params)
+
+    # Use early stopping to prevent overfitting
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_val, y_val)],
+        verbose=False
     )
 
-    random_search = RandomizedSearchCV(
-        estimator=xgb_model,
-        param_distributions=param_dist,
-        n_iter=200,
-        cv=3,
-        scoring='neg_log_loss',
-        random_state=42,
-        n_jobs=-1,
-        verbose=0
+    # Evaluate on validation set - return negative log loss since Optuna maximizes
+    y_pred_proba = model.predict_proba(X_val)
+    logloss = log_loss(y_val, y_pred_proba)
+
+    return -logloss  # Negative because Optuna maximizes, but we want to minimize log loss
+
+def tune_hyperparameters_optuna(X_train, y_train, X_val, y_val):
+    """Tune hyperparameters using Optuna optimization."""
+    print("Starting Optuna hyperparameter optimization...")
+    start_time = time.time()
+
+    # Create study
+    study = optuna.create_study(
+        direction='maximize',  # We want to maximize negative log loss (minimize log loss)
+        sampler=TPESampler(seed=42),  # Tree-structured Parzen Estimator
+        pruner=optuna.pruners.MedianPruner(
+            n_startup_trials=20,  # Don't prune for first 20 trials
+            n_warmup_steps=30,    # Don't prune for first 30 steps of each trial
+            interval_steps=10     # Prune every 10 steps
+        )
     )
 
-    random_search.fit(X_train, y_train)
+    # Optimize
+    study.optimize(
+        lambda trial: objective(trial, X_train, y_train, X_val, y_val),
+        n_trials=OPTUNA_N_TRIALS,
+        timeout=OPTUNA_TIMEOUT,
+        show_progress_bar=True
+    )
 
-    print(f"✓ Quick tuning complete. Best CV AUC: {random_search.best_score_:.4f}")
-    print("Best parameters:")
-    for param, value in random_search.best_params_.items():
+    elapsed_time = time.time() - start_time
+
+    print(f"✓ Optuna optimization complete ({elapsed_time:.1f}s)")
+    print(f"✓ Number of trials: {len(study.trials)}")
+    print(f"✓ Best trial Log Loss: {-study.best_value:.4f}")  # Convert back to positive
+
+    print("\nBest parameters:")
+    for param, value in study.best_params.items():
         print(f"  {param}: {value}")
 
-    random_search.best_params_['n_estimators'] *= 10
-    random_search.best_params_['learning_rate'] /= 10
+    # Train final model with best parameters
+    print("\nTraining final model with best parameters...")
+    best_params = study.best_params.copy()
+    best_params.update({
+        'objective': MODEL_OBJ,
+        'eval_metric': 'logloss',
+        'verbosity': 0,
+        'random_state': 42,
+        'early_stopping_rounds': 50
+    })
 
-    print("Retraining best model with early stopping...")
-    best_model = xgb.XGBClassifier(
-        **random_search.best_params_,
-        objective=MODEL_OBJ,
-        eval_metric='auc',
-        random_state=42,
-        verbosity=0,
-        early_stopping_rounds=50
-    )
-
+    best_model = xgb.XGBClassifier(**best_params)
     best_model.fit(
         X_train, y_train,
         eval_set=[(X_train, y_train), (X_val, y_val)],
         verbose=False
     )
 
-    y_val_pred_proba = best_model.predict_proba(X_val)[:, 1]
-    val_auc = roc_auc_score(y_val, y_val_pred_proba)
+    # Final validation score
+    y_val_pred_proba = best_model.predict_proba(X_val)
+    val_logloss = log_loss(y_val, y_val_pred_proba)
 
-    elapsed_time = time.time() - start_time
-    print(f"✓ Quick tuning complete ({elapsed_time:.1f}s)")
-    print(f"✓ Final validation AUC: {val_auc:.4f}")
+    print(f"✓ Final validation Log Loss: {val_logloss:.4f}")
 
-    return best_model, random_search.best_params_, val_auc
+    # Save optimization results
+    study_path = os.path.join(OUTPUT_DIR, f'optuna_study_{MODEL_VERSION}.pkl')
+    try:
+        import joblib
+        joblib.dump(study, study_path)
+        print(f"✓ Optuna study saved to {study_path}")
+    except ImportError:
+        print("✓ Optuna study not saved (joblib not available)")
+
+    # Print feature importance from best model
+    print("\nFeature importance (top 5):")
+    feature_names = [
+        'release_speed', 'release_pos_x', 'release_pos_z',
+        'b_hits_encoded', 'p_throws_encoded',
+        'pfx_x', 'pfx_z', 'x_norm', 'z_norm',
+        'same_handedness', 'balls', 'strikes'
+    ]
+
+    importances = best_model.feature_importances_
+    feature_importance = list(zip(feature_names, importances))
+    feature_importance.sort(key=lambda x: x[1], reverse=True)
+
+    for name, importance in feature_importance[:5]:
+        print(f"  {name}: {importance:.4f}")
+
+    return best_model, study.best_params, val_logloss
 
 def save_model_and_metadata(final_model, feature_columns, model_path):
     final_model.save_model(model_path)
