@@ -24,7 +24,7 @@ import xgboost as xgb
 DATA_DIR = 'data/'
 OUTPUT_DIR = 'model_output'
 MODEL_OBJ = 'binary:logistic'
-MODEL_VERSION = 'v4'
+MODEL_VERSION = 'v5'
 SKIP_HYPERPARAMETER_TUNING = False
 SKIP_ALL_TRAINING = SKIP_HYPERPARAMETER_TUNING
 SAVE_MODEL = True
@@ -46,12 +46,11 @@ def main():
     data = process_data(raw_data)
 
     feature_columns = [
-        'release_speed', 'release_pos_x', 'release_pos_z',
         'b_hits_encoded', 'p_throws_encoded',
         'pfx_x', 'pfx_z',
         'x_norm', 'z_norm',
         'same_handedness',
-        'balls', 'strikes'
+        'balls', 'strikes', 'outs_when_up'
     ]
 
     X = data[feature_columns]
@@ -148,9 +147,8 @@ def load_data():
     data = data.rename(columns={'stand': 'b_hits', 'type': 'call'})
 
     required_columns = [
-        'release_speed', 'release_pos_x', 'release_pos_z',
         'b_hits', 'p_throws',
-        'balls', 'strikes',
+        'balls', 'strikes', 'outs_when_up',
         'pfx_x', 'pfx_z',
         'plate_x', 'plate_z',
         'sz_top', 'sz_bot',
@@ -349,10 +347,9 @@ def tune_hyperparameters_optuna(X_train, y_train, X_val, y_val):
     # Print feature importance from best model
     print("\nFeature importance (top 5):")
     feature_names = [
-        'release_speed', 'release_pos_x', 'release_pos_z',
         'b_hits_encoded', 'p_throws_encoded',
         'pfx_x', 'pfx_z', 'x_norm', 'z_norm',
-        'same_handedness', 'balls', 'strikes'
+        'same_handedness', 'balls', 'strikes', 'outs_when_up'
     ]
 
     importances = best_model.feature_importances_
@@ -412,11 +409,10 @@ def save_model_and_metadata(final_model, feature_columns, model_path):
 
 def draw_strikezone_heat_map(data, model):
     features = data[[
-        'release_speed', 'release_pos_x', 'release_pos_z',
         'b_hits_encoded', 'p_throws_encoded',
         'pfx_x', 'pfx_z',
         'x_norm', 'z_norm',
-        'same_handedness', 'balls', 'strikes'
+        'same_handedness', 'balls', 'strikes', 'outs_when_up'
     ]]
     probs = model.predict_proba(features)[:, 1]
 
